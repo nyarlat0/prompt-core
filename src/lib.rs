@@ -7,6 +7,8 @@
 //! [`Preset`] provide the KoboldCpp adapter.
 
 mod builder;
+mod context;
+pub use context::{ContextBudget, FittedPrompt, TokenCounter};
 #[cfg(feature = "roleplay")]
 pub mod content;
 mod formatting;

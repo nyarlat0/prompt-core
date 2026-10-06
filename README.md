@@ -1,11 +1,7 @@
 # prompt-core
 
 Rust library for prompt rendering, SillyTavern-compatible prompt assembly and
-KoboldCpp generation. No Telegram or database dependency.
-
-The bot uses this crate through a Cargo path dependency. To move it into another
-repository, copy this entire directory: its manifest does not inherit workspace
-settings or depend on files outside this directory.
+KoboldCpp generation with model-aware context budgeting.
 
 ## Dependencies and features
 
@@ -105,6 +101,68 @@ A configured `TemplateEngine` can also be passed to
 `PromptBuilder::with_engine`. `BuiltPrompt` contains the final text and stop
 sequences. `PromptMessage` contains role, optional name and text; persistence
 and transport metadata belong to the application.
+
+## Context management
+
+Use `PromptBuilder::build_with_budget` to fit conversation history into the
+model context before generation. It returns a `FittedPrompt` containing the
+exact prompt, token count, input budget and number of omitted messages.
+
+```rust,no_run
+use prompt_core::{
+    ContextTemplate, FittedPrompt, InstructTemplate, KoboldClient,
+    Preset, PromptBuilder, PromptData, SystemPromptTemplate,
+};
+
+async fn prepare(
+    client: &KoboldClient,
+    builder: &PromptBuilder,
+    context: &ContextTemplate,
+    instruct: &InstructTemplate,
+    system: &SystemPromptTemplate,
+    data: &PromptData,
+    preset: &Preset,
+) -> anyhow::Result<FittedPrompt> {
+    builder.build_with_budget(
+        context, instruct, system, data, client, client.context_budget(preset)?,
+    ).await
+}
+```
+
+The input budget is `context_tokens - response_tokens - safety_tokens`.
+`ContextBudget::new` reserves 8 safety tokens by default. The response reserve
+matches the requested generation length: ST `genamt` or native `max_length`,
+defaulting explicitly to 256 if absent; zero and invalid values are rejected.
+
+The fitter removes oldest non-system messages as whole messages, preserving
+the latest conversational message and every system message. Description,
+scenario, personas, activated lore, story string and post-history instructions
+remain intact. Each candidate is rebuilt, including grouped turns and story
+injection positions, then tokenized as a complete string. The original
+`PromptData` and its full history are never modified. Lore activation is
+supplied by the caller and is not recalculated after trimming.
+
+After an initial full-prompt check, a binary search over history suffixes
+limits tokenizer round trips. Only an actually measured fitting prompt is
+returned. Custom expressions should be deterministic while fitting; unusual
+templates with non-monotonic sizes may retain less history than theoretically
+possible. If mandatory content plus the latest message does not fit, fitting
+returns an error with token counts instead of cutting instructions or message
+text. Reducing the response limit or mandatory content is the caller's choice.
+
+`TokenCounter` is backend-independent and can be implemented for other model
+providers. `KoboldClient` uses its loaded model's
+[`/api/extra/tokencount`](https://github.com/LostRuins/koboldcpp/wiki)
+endpoint with special tokens enabled. Tokenizer failures abort the request;
+there is no character-count fallback.
+
+Direct `generate` and `generate_request` calls also validate the final input
+against the budget before contacting the generation endpoint. They reject
+oversized raw prompts, since an opaque string has no safe message boundaries.
+Use the fitter for automatic history reduction. Native KoboldCpp `memory`,
+when supplied, is counted separately and included in the input budget.
+The library does not automatically retry a rejected generation or modify
+persistent conversation storage.
 
 ## KoboldCpp and other backends
 

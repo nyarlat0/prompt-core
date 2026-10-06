@@ -9,6 +9,16 @@ pub struct Preset {
 }
 
 impl Preset {
+    /// Explicit response reservation; missing genamt defaults to 256 tokens.
+    pub fn generation_length(&self) -> Result<u64> {
+        match self.raw.get("genamt") {
+            None => Ok(256),
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .context("preset genamt must be a positive integer"),
+        }
+    }
     /// Construct a SillyTavern sampling preset without filesystem access.
     pub fn from_value(raw: Value) -> Result<Self> {
         if !raw.is_object() {
@@ -46,6 +56,7 @@ impl Preset {
          *   max_context_length = context length
          */
         copy(src, &mut dst, "genamt", "max_length");
+        dst.insert("max_length".into(), self.generation_length()?.into());
         copy(src, &mut dst, "max_length", "max_context_length");
         dst.insert(
             "max_context_length".into(),

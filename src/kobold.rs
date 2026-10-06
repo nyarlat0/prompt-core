@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::preset::Preset;
+use crate::{ContextBudget, TokenCounter};
 
 #[derive(Clone)]
 pub struct KoboldClient {
@@ -30,6 +31,41 @@ struct GenerateResult {
 }
 
 impl KoboldClient {
+    pub fn context_budget(&self, preset: &Preset) -> Result<ContextBudget> {
+        Ok(ContextBudget::new(
+            self.max_context_length,
+            preset.generation_length()?,
+        ))
+    }
+
+    /// Uses the loaded model's tokenizer, including special tokens. Fail closed
+    /// when tokenization is unavailable; character-based estimates are unsafe.
+    pub async fn count_tokens(&self, prompt: &str) -> Result<u64> {
+        #[derive(Deserialize)]
+        struct Count {
+            value: u64,
+        }
+        let result = self
+            .http
+            .post(format!(
+                "{}/api/extra/tokencount",
+                self.base_url.trim_end_matches('/')
+            ))
+            .json(&serde_json::json!({"prompt": prompt, "special": true}))
+            .send()
+            .await
+            .context("KoboldCpp tokenization request failed")?
+            .error_for_status()
+            .context("KoboldCpp tokenization HTTP error")?
+            .json::<Count>()
+            .await
+            .context("KoboldCpp returned an invalid token count")?;
+        if result.value == 0 && !prompt.is_empty() {
+            bail!("KoboldCpp returned zero tokens for a nonempty prompt");
+        }
+        Ok(result.value)
+    }
+
     pub async fn connect(base_url: impl Into<String>) -> Result<Self> {
         Self::connect_with_client(base_url, Client::new()).await
     }
@@ -64,6 +100,30 @@ impl KoboldClient {
     }
 
     async fn generate_json(&self, request: &Value) -> Result<String> {
+        let response_tokens = request["max_length"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .context("max_length must be a positive integer")?;
+        let limit = ContextBudget::new(self.max_context_length, response_tokens).input_tokens()?;
+        let mut tokens = self
+            .count_tokens(request["prompt"].as_str().context("prompt must be text")?)
+            .await?;
+        if let Some(memory) = request
+            .get("memory")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            tokens = tokens
+                .checked_add(self.count_tokens(memory).await?)
+                .context("token count overflow")?;
+        }
+        if tokens > limit {
+            bail!(
+                "Промпт превышает контекст: {} токенов при бюджете {}. Используйте PromptBuilder::build_with_budget или сократите входные данные.",
+                tokens,
+                limit
+            );
+        }
         let url = format!("{}/api/v1/generate", self.base_url.trim_end_matches('/'));
 
         let response = self
@@ -98,6 +158,9 @@ impl KoboldClient {
             .cloned()
             .context("model generation parameters must be a JSON object")?;
         params.insert("prompt".into(), Value::String(request.prompt.clone()));
+        params
+            .entry("max_length".to_owned())
+            .or_insert(Value::from(256));
         params.insert(
             "max_context_length".into(),
             Value::Number(self.max_context_length.into()),
@@ -198,5 +261,14 @@ impl ModelClient for KoboldClient {
         request: &'a GenerationRequest,
     ) -> Pin<Box<dyn Future<Output = Result<GenerationResponse>> + Send + 'a>> {
         Box::pin(self.generate_request(request))
+    }
+}
+
+impl TokenCounter for KoboldClient {
+    fn count_tokens<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(KoboldClient::count_tokens(self, text))
     }
 }

@@ -10,6 +10,10 @@ pub struct SystemPromptTemplate {
     #[serde(default)]
     pub content: String,
 
+    /// Ephemeral final user message, rendered before post_history.
+    #[serde(default)]
+    pub user_prompt: String,
+
     #[serde(default)]
     pub post_history: String,
 

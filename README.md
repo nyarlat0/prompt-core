@@ -58,6 +58,12 @@ Rendering does not HTML-escape the prompt. Handlebars built-ins such as
 SillyTavern macro that removes adjacent line breaks. Substituted values are
 not recursively evaluated as templates.
 
+System prompt JSON may also contain `user_prompt` (default: empty). It uses
+the same template environment as `content` and `post_history`, including custom
+directives. Nonempty rendered text becomes a final User message after history
+and before the system `post_history`. It is ephemeral, is included in token
+budgeting, and remains present when old history messages are dropped.
+
 ## SillyTavern prompt builder
 
 `PromptBuilder` reuses the same expression registry across all rendering

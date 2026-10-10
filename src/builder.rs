@@ -154,9 +154,18 @@ impl PromptBuilder {
             StoryStringPosition::InChat { role, .. } => Some((story.as_str(), role)),
         };
 
+        let user_prompt = self.engine.render(&sysprompt.user_prompt, &base_env)?;
+        let mut messages = data.messages.clone();
+        if !user_prompt.trim().is_empty() {
+            messages.push(PromptMessage {
+                role: PromptRole::User,
+                name: None,
+                content: user_prompt,
+            });
+        }
         self.append_history(
             &mut prompt,
-            &data.messages,
+            &messages,
             instruct,
             &base_env,
             data,

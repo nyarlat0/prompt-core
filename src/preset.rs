@@ -54,6 +54,8 @@ impl Preset {
          * KoboldCpp:
          *   max_length         = generation length
          *   max_context_length = context length
+         *   reasoning_effort
+         *   thinking_budget_tokens
          */
         copy(src, &mut dst, "genamt", "max_length");
         dst.insert("max_length".into(), self.generation_length()?.into());
@@ -61,6 +63,13 @@ impl Preset {
         dst.insert(
             "max_context_length".into(),
             Value::Number(max_context_length.into()),
+        );
+        copy(src, &mut dst, "reasoning_effort", "reasoning_effort");
+        copy(
+            src,
+            &mut dst,
+            "thinking_budget_tokens",
+            "thinking_budget_tokens",
         );
 
         // Основные samplers.

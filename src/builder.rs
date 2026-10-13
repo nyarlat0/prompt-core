@@ -62,6 +62,76 @@ impl PromptBuilder {
         sysprompt: &SystemPromptTemplate,
         data: &PromptData,
     ) -> Result<BuiltPrompt> {
+        let RenderedParts {
+            base_env,
+            story_env,
+            story,
+            messages,
+            post_history,
+        } = self.render_parts(context, sysprompt, data)?;
+
+        let mut prompt = String::new();
+
+        let story_spec = context.story_string_spec();
+
+        if matches!(story_spec.position, StoryStringPosition::Top) {
+            self.append_story_string(&mut prompt, &story, instruct, &story_env)?;
+        }
+
+        self.append_chat_start(&mut prompt, context, &story_env)?;
+
+        let story_injection = match story_spec.position {
+            StoryStringPosition::Top => None,
+
+            StoryStringPosition::InChat { role, .. } => Some((story.as_str(), role)),
+        };
+
+        self.append_history(
+            &mut prompt,
+            &messages,
+            instruct,
+            &base_env,
+            data,
+            story_injection,
+            context.story_string_depth,
+        )?;
+
+        /*
+         * post_history в ST добавляется после истории
+         * перед следующей репликой модели.
+         */
+        if !post_history.is_empty() {
+            let message = PromptMessage::system(post_history);
+
+            let formatted =
+                self.format_message(&message, instruct, &base_env, data, false, true)?;
+
+            prompt.push_str(&formatted);
+        }
+
+        /*
+         * Последняя строка prompt:
+         *
+         * <|turn>model
+         *
+         * После неё KoboldCpp начинает completion.
+         */
+        prompt.push_str(&self.generation_prefix(instruct, &base_env, data)?);
+
+        let stop_sequences = self.stop_sequences(context, instruct, &base_env, data)?;
+
+        Ok(BuiltPrompt {
+            text: prompt,
+            stop_sequences,
+        })
+    }
+
+    pub(crate) fn render_parts(
+        &self,
+        context: &ContextTemplate,
+        sysprompt: &SystemPromptTemplate,
+        data: &PromptData,
+    ) -> Result<RenderedParts> {
         let mut base_env = Self::base_environment(data);
         let personas = self.engine.render(&data.personas, &base_env)?;
         base_env["personas"] = Value::String(personas.clone());
@@ -138,22 +208,6 @@ impl PromptBuilder {
             .render(&context.story_string, &story_env)
             .context("failed to render story string")?;
 
-        let mut prompt = String::new();
-
-        let story_spec = context.story_string_spec();
-
-        if matches!(story_spec.position, StoryStringPosition::Top) {
-            self.append_story_string(&mut prompt, &story, instruct, &story_env)?;
-        }
-
-        self.append_chat_start(&mut prompt, context, &story_env)?;
-
-        let story_injection = match story_spec.position {
-            StoryStringPosition::Top => None,
-
-            StoryStringPosition::InChat { role, .. } => Some((story.as_str(), role)),
-        };
-
         let user_prompt = self.engine.render(&sysprompt.user_prompt, &base_env)?;
         let mut messages = data.messages.clone();
         if !user_prompt.trim().is_empty() {
@@ -163,48 +217,17 @@ impl PromptBuilder {
                 content: user_prompt,
             });
         }
-        self.append_history(
-            &mut prompt,
-            &messages,
-            instruct,
-            &base_env,
-            data,
-            story_injection,
-            context.story_string_depth,
-        )?;
-
-        /*
-         * post_history в ST добавляется после истории
-         * перед следующей репликой модели.
-         */
         let post_history = self.render_joined(
             &[&sysprompt.post_history, &data.character_post_history],
             &base_env,
         )?;
 
-        if !post_history.is_empty() {
-            let message = PromptMessage::system(post_history);
-
-            let formatted =
-                self.format_message(&message, instruct, &base_env, data, false, true)?;
-
-            prompt.push_str(&formatted);
-        }
-
-        /*
-         * Последняя строка prompt:
-         *
-         * <|turn>model
-         *
-         * После неё KoboldCpp начинает completion.
-         */
-        prompt.push_str(&self.generation_prefix(instruct, &base_env, data)?);
-
-        let stop_sequences = self.stop_sequences(context, instruct, &base_env, data)?;
-
-        Ok(BuiltPrompt {
-            text: prompt,
-            stop_sequences,
+        Ok(RenderedParts {
+            base_env,
+            story_env,
+            story,
+            messages,
+            post_history,
         })
     }
 
@@ -355,7 +378,7 @@ impl PromptBuilder {
         Ok(())
     }
 
-    fn group_roleplay_messages(
+    pub(crate) fn group_roleplay_messages(
         messages: &[PromptMessage],
         data: &PromptData,
     ) -> Vec<PromptMessage> {
@@ -779,4 +802,12 @@ mod tests {
         assert!(built.text.contains("<system>Инструкция после истории"));
         assert!(!built.text.contains("<user>Инструкция после истории"));
     }
+}
+
+pub(crate) struct RenderedParts {
+    pub base_env: Value,
+    pub story_env: Value,
+    pub story: String,
+    pub messages: Vec<PromptMessage>,
+    pub post_history: String,
 }

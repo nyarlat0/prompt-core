@@ -7,6 +7,10 @@
 //! [`Preset`] provide the KoboldCpp adapter.
 
 mod builder;
+mod chat;
+pub use chat::{
+    ChatGenerationRequest, ChatMessage, ChatPreview, ChatRole, ChatTokenCounter, FittedChatPrompt,
+};
 mod context;
 pub use context::{ContextBudget, FittedPrompt, TokenCounter};
 #[cfg(feature = "roleplay")]

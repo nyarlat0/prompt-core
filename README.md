@@ -211,6 +211,83 @@ async fn complete(client: &dyn ModelClient, prompt: String) -> anyhow::Result<St
 `parameters` is a JSON object. For KoboldCpp, prompt, stop sequences and the
 detected maximum context length override corresponding parameter keys.
 
+## Chat Completion
+
+Select the structured API with `KoboldClient::generate_chat`; existing
+`generate`, `generate_request` and `ModelClient` calls remain Text Completion.
+Chat requests go to `/v1/chat/completions` and decode
+`choices[0].message.content`. This is the KoboldCpp chat adapter, not a generic
+client for arbitrary OpenAI-compatible servers: context discovery and chat
+tokenization require KoboldCpp endpoints.
+
+`PromptBuilder::build_chat` renders story fields and custom expressions through
+the same pipeline as the text builder, then returns `ChatMessage` values with
+lowercase `system`, `user`, and `assistant` wire roles. The top story is
+system content; in-chat story injections retain their role and depth.
+Group history keeps only the active character's turns as assistant, merging
+other turns with double newlines. Ephemeral `user_prompt` and system
+post-history instructions preserve their positions.
+
+Local instruct tokens and assistant prefixes are not included in message
+contents. The server applies its configured model chat template exactly once.
+Message names are not sent as API `name` fields or prepended to the content.
+A text-only `context.chat_start` is rejected; use a context without it.
+Instruct-derived and context-derived text stop strings are not inferred for
+chat: supply `ChatGenerationRequest.stop_sequences` explicitly. Story-string
+contents should contain semantic text, not manually embedded instruct tags.
+
+```rust,no_run
+use prompt_core::{
+    ChatGenerationRequest, ContextTemplate, KoboldClient, Preset,
+    PromptBuilder, PromptData, SystemPromptTemplate,
+};
+
+async fn chat(
+    client: &KoboldClient,
+    builder: &PromptBuilder,
+    context: &ContextTemplate,
+    system: &SystemPromptTemplate,
+    data: &PromptData,
+    preset: &Preset,
+) -> anyhow::Result<String> {
+    // The fitter fills messages from PromptData. Set native sampling parameters
+    // or chat_template_kwargs on options.parameters if needed.
+    let options = ChatGenerationRequest::from_preset(Vec::new(), preset)?;
+    let fitted = builder.build_chat_with_budget(
+        context, system, data, client, &options, client.context_budget(preset)?,
+    ).await?;
+    println!("{}", fitted.preview.prompt);
+    Ok(client.generate_chat(&fitted.request).await?.text)
+}
+```
+
+For custom applications, use `ChatGenerationRequest::new(messages)` without
+the ST builder. Parameters use chat endpoint names such as `max_tokens`,
+`temperature`, `model`, `adapter`, and `chat_template_kwargs`.
+`from_preset` translates ST samplers, including the response limit and
+Mirostat naming. The adapter requests one non-streaming text response and a
+new assistant turn, rather than continuation of the last historical assistant
+message. Tools, multimodal inputs and conflicting raw prompt/length fields
+are rejected.
+
+`preview_chat` sends the same messages and settings to the backend's
+`/api/extra/tokencount` renderer and returns its final prompt and token count.
+Budget fitting uses that count, including server template overhead, while
+preserving mandatory blocks and the latest conversational message. Generation
+performs the same preflight again. Missing preview support, empty/invalid
+counts, overflow, or dropped/changed/reordered non-whitespace message content
+produce an error before generation. There is no text-mode fallback.
+
+The server must have a suitable model chat template configured. Role
+boundaries are supplied as structured messages, but exact token delimiters
+and assistant prefixes belong to that server template and need not match a
+local `InstructTemplate`. The content-order check detects common lossy
+templates; it does not prove semantic equivalence of arbitrary server
+templates or guard against a model/template being replaced between requests.
+Use `preview_chat` or `FittedChatPrompt.preview` to inspect the actual input.
+Never put `BuiltPrompt.text` into a single chat message: doing so applies
+chat formatting twice.
+
 ## Roleplay content (optional)
 
 With `roleplay` enabled, `prompt_core::content` exposes character card

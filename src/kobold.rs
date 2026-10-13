@@ -10,8 +10,8 @@ use crate::{ContextBudget, TokenCounter};
 
 #[derive(Clone)]
 pub struct KoboldClient {
-    http: Client,
-    base_url: String,
+    pub(crate) http: Client,
+    pub(crate) base_url: String,
     max_context_length: u64,
 }
 

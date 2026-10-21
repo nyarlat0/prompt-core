@@ -267,8 +267,9 @@ the ST builder. Parameters use chat endpoint names such as `max_tokens`,
 `from_preset` translates ST samplers, including the response limit and
 Mirostat naming. The adapter requests one non-streaming text response and a
 new assistant turn, rather than continuation of the last historical assistant
-message. Tools, multimodal inputs and conflicting raw prompt/length fields
-are rejected.
+message. Multimodal inputs and conflicting raw prompt/length fields are rejected.
+Tools use the extended structured API described below; raw parameter overrides
+for tools remain forbidden.
 
 `preview_chat` sends the same messages and settings to the backend's
 `/api/extra/tokencount` renderer and returns its final prompt and token count.
@@ -294,3 +295,193 @@ With `roleplay` enabled, `prompt_core::content` exposes character card
 loading (PNG/JSON), lorebook loading and activation, and the Russian lemmatizer.
 Applications select active books, participants and their order; activated
 text can be passed through `PromptData.wi_before` and `wi_after`.
+
+
+## Tool calling
+
+The protocol types and `KoboldClient::generate_chat_full` are always available.
+For the optional Rust executor, enable `features = ["tool-execution"]` and use a
+Tokio runtime with its time driver enabled. No agent framework or MCP dependency
+is required. Existing `ChatMessage` and `ChatGenerationRequest` struct literals
+remain source-compatible. `ChatGenerationRequest::with_tools` converts to
+`ChatCompletionRequest`; `From<ChatGenerationRequest>` also preserves presets,
+stops and generation parameters. Text Completion is unchanged.
+
+`ChatCompletionMessage` adds assistant `tool_calls`, optional text/reasoning and
+`role: "tool"` results linked by ID. `ChatGenerationResponse` exposes `message`,
+`content`, `reasoning_content`, `finish_reason`, and `tool_calls`. The original
+assistant message, including unknown extension fields, can be replayed. Missing
+finish reasons on older backends remain `None`. Null content with calls is valid.
+`ToolCall::arguments::<T>()` parses the original argument string with contextual
+errors; decoding the response itself never requires valid argument JSON.
+`generate_chat` still returns text, but errors on tool calls instead of silently
+turning them into text. Receiving a call never runs a function automatically.
+
+```rust,no_run
+use prompt_core::{
+    ChatCompletionMessage as Message, ChatGenerationRequest, ChatMessage,
+    ChatRole, KoboldClient, ToolChoice, ToolDefinition,
+};
+use serde_json::{Value, json};
+
+async fn manual(client: &KoboldClient) -> anyhow::Result<()> {
+    let tool = ToolDefinition::new("normalize", "Normalize supplied text", json!({
+        "type": "object", "properties": {"text": {"type": "string"}},
+        "required": ["text"], "additionalProperties": false
+    }));
+    let mut request = ChatGenerationRequest::new(vec![ChatMessage {
+        role: ChatRole::User, content: "Normalize HELLO".into(),
+    }]).with_tools(vec![tool]);
+    request.tool_choice = Some(ToolChoice::Auto);
+    request.chat_template_kwargs.insert("enable_thinking".into(), false.into());
+    request.parameters["max_tokens"] = json!(256);
+
+    let response = client.generate_chat_full(&request).await?;
+    // Store the whole assistant message, including all call IDs and reasoning.
+    request.messages.push(response.message);
+    for call in response.tool_calls {
+        anyhow::ensure!(call.function.name == "normalize", "Unknown tool");
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args { text: String }
+        let args: Args = call.arguments()?;
+        let result: Value = json!({"text": args.text.to_lowercase()});
+        request.messages.push(Message::tool(call.id, &result));
+    }
+    // Only continue after supplying ALL results. For a bounded automatic
+    // continuation, use ToolRegistry below.
+    Ok(())
+}
+```
+
+`ToolChoice` supports `Auto`, `None`, `Required`, and `Function(name)` using the
+OpenAI wire format. Required/forced choices are checked against the response;
+servers that ignore them cause an error. `request.disable_tools()` removes tool
+definitions and sets `none`. The typed `chat_template_kwargs` map supports
+`enable_thinking` and model-specific options. Legacy parameters can still carry
+that map, but setting it in both places is an error. Overrides of messages,
+tools, generation-prefix controls and other reserved fields are rejected.
+
+### Rust handlers and child generation
+
+```rust,no_run
+# #[cfg(feature = "tool-execution")]
+# async fn example(client: &prompt_core::KoboldClient) -> anyhow::Result<()> {
+use prompt_core::{
+    ChatCompletionMessage as Message, ChatCompletionRequest, ToolDefinition,
+    ToolExecutionOptions, ToolRegistry,
+};
+use serde_json::json;
+use std::time::Duration;
+
+let mut registry = ToolRegistry::new();
+registry.register(
+    ToolDefinition::new("summarize", "Summarize the supplied text", json!({
+        "type":"object", "properties":{"text":{"type":"string"}},
+        "required":["text"]
+    })),
+    |ctx, arguments| Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args { text: String }
+        let args: Args = serde_json::from_value(arguments)?;
+        let mut child = ChatCompletionRequest::new(vec![
+            Message::system("Give a one-sentence summary."),
+            Message::user(args.text),
+        ]);
+        child.parameters = json!({"temperature":0.2, "max_tokens":128});
+        child.chat_template_kwargs.insert("enable_thinking".into(), false.into());
+        // Same KoboldClient, same loaded model; separate messages/settings.
+        // This helper always disables child tools, even if provided by mistake.
+        let answer = ctx.generate_child(child).await?;
+        Ok(json!({"summary": answer.content}))
+    }),
+)?;
+
+let mut request = ChatCompletionRequest::new(vec![
+    Message::user("Use summarize to summarize: Rust supports async functions."),
+]);
+request.tools = registry.definitions();
+let options = ToolExecutionOptions {
+    max_rounds: 4, max_calls: 8,
+    handler_timeout: Duration::from_secs(120),
+    total_timeout: Duration::from_secs(600),
+};
+let answer = registry.run(client, &mut request, &options).await?;
+println!("{}", answer.content.unwrap_or_default());
+// request.messages now includes calls, results and the final assistant reply.
+# Ok(())
+# }
+```
+
+Register ordinary functions in the same way: return `Ok(json!(my_function(...)))`
+inside the async handler. Arguments must be JSON objects. Handlers validate types
+and application constraints with Serde or a validator of the application's
+choice; the library does **not** implement a JSON Schema validation engine.
+`registry.execute(client, &call, timeout).await` explicitly executes a single
+registered call and returns its JSON result. It does not modify history.
+
+`run` uses only tools listed in the request, verifies their registered definitions,
+prechecks each batch, runs calls sequentially, and supplies one result per ID in
+response order. HTTP calls hold no client mutex, so a handler can reuse
+`ctx.client()` for custom child requests (including Text Completion) without
+reentrant deadlock. Callers own scheduling of independent concurrent runs on the
+same server. `generate_child` provides the safe tool-free default.
+
+Limits apply per run. An extra tool round beyond `max_rounds`, or a batch exceeding
+`max_calls`, fails before executing that batch. Nested executor invocation on the
+same Tokio task is rejected; child HTTP generation is allowed. Application code
+must not bypass this guard by spawning unbounded independent executor tasks.
+Handlers must be cooperative async code: use appropriate isolation for blocking
+work; Tokio timeouts cannot interrupt a synchronous function blocking its thread.
+
+Unknown tools, invalid JSON, handler failures and timeouts are errors, not model
+text. Handler failures append an error result and skipped results for the rest of
+the batch, then abort without another generation. A total timeout/cancellation
+can leave a pending exchange in the caller's transcript. Inspect it before
+resuming; incomplete exchanges are rejected before HTTP, and side effects are
+never automatically retried or rolled back. Handler panics are application bugs
+and follow the application's normal panic policy.
+
+### Context and backend requirements
+
+For tools, build initial semantic messages with `PromptBuilder::build_chat`,
+convert with `ChatGenerationRequest::with_tools`, then call
+`client.fit_chat(&request).await?`. The older `build_chat_with_budget` remains for
+legacy tool-free requests. Do not budget first and then add uncounted schemas or
+results. `ToolRegistry::run` calls `fit_chat` before every generation, leaving the
+full caller transcript intact. Use `FittedChatCompletion.preview` to inspect the
+exact input and token count sent for that turn.
+
+Both `preview_chat` and `generate_chat_full` accept old or extended requests.
+Every candidate includes tools, calls, results and template kwargs in
+`/api/extra/tokencount`; generation repeats the exact server preflight. No local
+approximate tokenizer is used. `fit_chat` preserves all system messages and the
+latest conversational unit. An assistant with calls and its complete contiguous
+set of results is one indivisible unit. Missing, duplicated or orphaned IDs fail
+validation. If mandatory content cannot fit, generation fails.
+
+Run a tool-capable model on KoboldCpp with `--jinja --jinjatools` (aliases may
+vary by version), using its appropriate tool-aware Jinja template. See the
+[official flags documentation](https://koboldcpp.net/docs/reference/flags/)
+and [KoboldCpp source](https://github.com/LostRuins/koboldcpp/blob/concedo/koboldcpp.py).
+Older backends/templates may ignore tools or format them through a legacy adapter.
+The preview must return the complete rendered prompt and its token count.
+
+The safety check requires ordinary message content in order, complete JSON
+function definitions (including schema and description), and JSON call arguments
+in the rendered preview. JSON whitespace and object-key order may differ.
+Templates that render schemas/arguments solely as XML, prose or omit fields are
+conservatively rejected; there is no unsafe fallback. Reasoning fields are
+preserved on the wire; their rendering is controlled by the server template.
+These checks catch common lossy templates, but cannot prove equivalence of every
+custom template or protect against server reconfiguration between preview and
+generation. Do not configure server-side parameter overrides that replace the
+request or switch the loaded model during a run.
+
+An optional live example (not run by tests):
+
+```sh
+cargo run -p prompt-core --example tool_chat --features tool-execution -- http://localhost:5001
+```
+
+Standard tests use local mock HTTP servers and require no model process.

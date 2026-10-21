@@ -84,7 +84,7 @@ impl ChatGenerationRequest {
         })
     }
 
-    fn payload(&self, max_context: u64) -> Result<Value> {
+    pub(crate) fn payload(&self, max_context: u64) -> Result<Value> {
         if self.messages.is_empty() {
             bail!("Chat Completion requires at least one message");
         }
@@ -288,7 +288,7 @@ impl PromptBuilder {
 impl KoboldClient {
     async fn preview_chat_payload(
         &self,
-        request: &ChatGenerationRequest,
+        request: &crate::ChatCompletionRequest,
         payload: &Value,
     ) -> Result<ChatPreview> {
         let mut payload = payload.clone();
@@ -313,23 +313,16 @@ impl KoboldClient {
         if preview.prompt.is_empty() || preview.tokens == 0 {
             bail!("Backend did not render/tokenize the chat messages; refusing unsafe generation");
         }
-        // Fail closed if the server template drops or reorders instructions.
-        let mut remaining = preview.prompt.as_str();
-        for message in &request.messages {
-            let content = message.content.trim();
-            if content.is_empty() {
-                continue;
-            }
-            let at = remaining
-                .find(content)
-                .context("Backend chat template dropped, changed or reordered message content")?;
-            remaining = &remaining[at + content.len()..];
-        }
+        crate::tool_chat::validate_tool_preview(request, &preview.prompt)?;
         Ok(preview)
     }
 
-    pub async fn preview_chat(&self, request: &ChatGenerationRequest) -> Result<ChatPreview> {
-        self.preview_chat_payload(request, &request.payload(self.max_context_length())?)
+    pub async fn preview_chat(
+        &self,
+        request: &(impl crate::ChatRequest + ?Sized),
+    ) -> Result<ChatPreview> {
+        let request = request.to_completion_request();
+        self.preview_chat_payload(&request, &request.payload(self.max_context_length())?)
             .await
     }
 
@@ -339,32 +332,35 @@ impl KoboldClient {
         &self,
         request: &ChatGenerationRequest,
     ) -> Result<GenerationResponse> {
+        let response = self.generate_chat_full(request).await?;
+        if !response.tool_calls.is_empty() {
+            bail!("Chat returned tool calls; use generate_chat_full to handle them explicitly");
+        }
+        Ok(GenerationResponse {
+            text: response
+                .content
+                .context("Chat completion returned no text content")?,
+        })
+    }
+
+    pub async fn generate_chat_full(
+        &self,
+        request: &(impl crate::ChatRequest + ?Sized),
+    ) -> Result<crate::ChatGenerationResponse> {
+        let request = request.to_completion_request();
         let payload = request.payload(self.max_context_length())?;
         let limit = ContextBudget::new(
             self.max_context_length(),
             payload["max_tokens"].as_u64().unwrap(),
         )
         .input_tokens()?;
-        let preview = self.preview_chat_payload(request, &payload).await?;
+        let preview = self.preview_chat_payload(&request, &payload).await?;
         if preview.tokens > limit {
             bail!(
                 "Chat prompt uses {} tokens, input budget is {}; use build_chat_with_budget",
                 preview.tokens,
                 limit
             );
-        }
-        #[derive(Deserialize)]
-        struct Response {
-            choices: Vec<Choice>,
-        }
-        #[derive(Deserialize)]
-        struct Choice {
-            message: Message,
-        }
-        #[derive(Deserialize)]
-        struct Message {
-            role: String,
-            content: Option<String>,
         }
         let response = self
             .http
@@ -378,23 +374,27 @@ impl KoboldClient {
             .context("Chat completion request failed")?
             .error_for_status()
             .context("Chat completion HTTP error")?
-            .json::<Response>()
+            .json::<Value>()
             .await
             .context("Invalid chat completion response")?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .context("Chat completion returned no choices")?;
-        if choice.message.role != "assistant" {
-            bail!("Chat completion returned a non-assistant role");
+        let response = crate::ChatGenerationResponse::decode(response)?;
+        if matches!(request.tool_choice, Some(crate::ToolChoice::None))
+            && !response.tool_calls.is_empty()
+        {
+            bail!("Backend returned tool calls despite tool_choice none");
         }
-        Ok(GenerationResponse {
-            text: choice
-                .message
-                .content
-                .context("Chat completion returned no text content")?,
-        })
+        if let Some(crate::ToolChoice::Function(name)) = &request.tool_choice
+            && (response.tool_calls.is_empty()
+                || response.tool_calls.iter().any(|c| &c.function.name != name))
+        {
+            bail!("Backend did not honor forced tool choice {name}");
+        }
+        if matches!(request.tool_choice, Some(crate::ToolChoice::Required))
+            && response.tool_calls.is_empty()
+        {
+            bail!("Backend did not honor required tool choice");
+        }
+        Ok(response)
     }
 }
 

@@ -7,9 +7,11 @@ readme = "README.md"
 
 [features]
 default = []
+tool-execution = ["dep:tokio"]
 roleplay = ["dep:base64", "dep:rsmorphy"]
 
 [dependencies]
+tokio = { version = "1.53.1", features = ["rt", "time"], optional = true }
 anyhow = "1.0.104"
 base64 = { version = "0.22.1", optional = true }
 rsmorphy = { version = "0.4.0", optional = true }
@@ -20,3 +22,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt", "macros"] }
+
+[[example]]
+name = "tool_chat"
+required-features = ["tool-execution"]

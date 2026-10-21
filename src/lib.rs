@@ -32,3 +32,14 @@ pub use types::{
     BuiltPrompt, PromptData, PromptMessage, PromptRole, StoryStringPosition, StoryStringRole,
     StoryStringSpec,
 };
+
+mod tool_chat;
+pub use tool_chat::{
+    ChatCompletionMessage, ChatCompletionRequest, ChatGenerationResponse, ChatRequest,
+    FittedChatCompletion, FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolDefinition,
+    ToolType,
+};
+#[cfg(feature = "tool-execution")]
+mod tool_execution;
+#[cfg(feature = "tool-execution")]
+pub use tool_execution::{ToolContext, ToolExecutionOptions, ToolFuture, ToolRegistry};

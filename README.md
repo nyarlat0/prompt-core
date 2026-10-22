@@ -267,7 +267,8 @@ the ST builder. Parameters use chat endpoint names such as `max_tokens`,
 `from_preset` translates ST samplers, including the response limit and
 Mirostat naming. The adapter requests one non-streaming text response and a
 new assistant turn, rather than continuation of the last historical assistant
-message. Multimodal inputs and conflicting raw prompt/length fields are rejected.
+message. Conflicting raw prompt/length fields are rejected. For multimodal
+content, convert to `ChatCompletionRequest` after building the text messages.
 Tools use the extended structured API described below; raw parameter overrides
 for tools remain forbidden.
 
@@ -485,3 +486,58 @@ cargo run -p prompt-core --example tool_chat --features tool-execution -- http:/
 ```
 
 Standard tests use local mock HTTP servers and require no model process.
+
+## Multimodal Chat Completion
+
+`PromptBuilder`, `PromptData`, `PromptMessage` and `ChatMessage` remain text-only.
+Existing string constructors and text request JSON are unchanged. Attach images
+at the wire-request boundary, after rendering the text template:
+
+```rust
+use prompt_core::{ChatCompletionMessage, ChatCompletionRequest, ContentPart};
+let request = ChatCompletionRequest::new(vec![
+    ChatCompletionMessage::user_parts(vec![
+        ContentPart::text("Describe this board."),
+        ContentPart::image_url("data:image/png;base64,..."),
+    ]),
+]);
+```
+
+`ChatContent` serializes as a string or an ordered array of tagged `text` /
+`image_url` parts. `ImageUrl` accepts an unchanged URL/data URI and optional
+`detail: auto|low|high`. PNG data URIs use standard base64. There is no implicit
+download, image resizing, or base64 tokenization. HTTP(S) image URLs are represented
+on the OpenAI wire, but backend support varies: KoboldCpp's current adapter uses
+data URIs, so applications should use those.
+
+Text constructors (`system`, `user`, `assistant`, `tool`) remain compatible;
+direct rich-message struct literals now use `ChatContent` (`"text".into()`).
+`content()` borrows a plain string, while `text_parts()` accesses textual parts
+without discarding the raw multimodal message. Response `content` concatenates
+text parts in order; `message` retains the original parts, `reasoning_content`,
+tool calls and extension fields. Image-only replies are not mistaken for text.
+
+Use the same `client.fit_chat(&request)` and `generate_chat_full(&fitted.request)`
+as tools/reasoning. `generate_chat` also accepts the rich request for text-only
+responses. Tools, template kwargs and reasoning options travel unchanged with
+images. Trimming removes entire messages/exchanges, never individual image
+parts; the latest conversational unit and system messages remain mandatory.
+
+**Vision context accounting:** KoboldCpp's `tokencount` renders image markers but
+does not count vision embeddings. `image_token_reserve` defaults to **4096 per
+image**, added to every preview's token count, both during fitting and the final
+preflight check. It is local accounting, not an API generation parameter. Configure
+it for the actual model/encoder/resolution; 4096 is a conservative starting value,
+not a universal upper bound or exact count. Base64 bytes are never counted as text.
+If the mandatory image+text+output budget cannot fit, generation fails, rather
+than silently removing the image. The server must load a vision-capable model
+and its matching multimodal projector. A successful HTTP request alone cannot
+prove the model actually understood the picture.
+
+Tests cover wire roundtrips, text compatibility, response parts, tools/reasoning
+coexistence, context trimming and mandatory-image overflow using a local Kobold
+protocol server. Optional live smoke test:
+
+```sh
+KOBOLD_URL=http://aistation:5001 cargo test -p prompt-core --test multimodal live_kobold_png -- --ignored
+```

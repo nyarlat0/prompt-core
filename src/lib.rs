@@ -33,7 +33,9 @@ pub use types::{
     StoryStringSpec,
 };
 
+mod multimodal;
 mod tool_chat;
+pub use multimodal::{ChatContent, ContentPart, ImageDetail, ImageUrl};
 pub use tool_chat::{
     ChatCompletionMessage, ChatCompletionRequest, ChatGenerationResponse, ChatRequest,
     FittedChatCompletion, FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolDefinition,

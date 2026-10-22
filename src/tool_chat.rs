@@ -119,13 +119,13 @@ impl ToolCall {
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum ChatCompletionMessage {
     System {
-        content: String,
+        content: crate::ChatContent,
     },
     User {
-        content: String,
+        content: crate::ChatContent,
     },
     Assistant {
-        content: Option<String>,
+        content: Option<crate::ChatContent>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
         #[serde(
@@ -151,17 +151,17 @@ fn deserialize_calls<'de, D: serde::Deserializer<'de>>(
 impl ChatCompletionMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self::System {
-            content: content.into(),
+            content: crate::ChatContent::Text(content.into()),
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self::User {
-            content: content.into(),
+            content: crate::ChatContent::Text(content.into()),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant {
-            content: Some(content.into()),
+            content: Some(crate::ChatContent::Text(content.into())),
             reasoning_content: None,
             tool_calls: Vec::new(),
             extra: Map::new(),
@@ -175,10 +175,32 @@ impl ChatCompletionMessage {
     }
     pub fn content(&self) -> Option<&str> {
         match self {
-            Self::System { content } | Self::User { content } | Self::Tool { content, .. } => {
-                Some(content)
+            Self::System { content } | Self::User { content } => content.as_text(),
+            Self::Tool { content, .. } => Some(content),
+            Self::Assistant { content, .. } => {
+                content.as_ref().and_then(crate::ChatContent::as_text)
             }
-            Self::Assistant { content, .. } => content.as_deref(),
+        }
+    }
+    pub fn user_parts(parts: Vec<crate::ContentPart>) -> Self {
+        Self::User {
+            content: crate::ChatContent::Parts(parts),
+        }
+    }
+    pub fn text_parts(&self) -> Vec<&str> {
+        match self {
+            Self::System { content } | Self::User { content } => content.text_parts(),
+            Self::Assistant { content, .. } => {
+                content.as_ref().map(|c| c.text_parts()).unwrap_or_default()
+            }
+            Self::Tool { content, .. } => vec![content],
+        }
+    }
+    pub fn image_count(&self) -> usize {
+        match self {
+            Self::System { content } | Self::User { content } => content.image_count(),
+            Self::Assistant { content, .. } => content.as_ref().map_or(0, |c| c.image_count()),
+            Self::Tool { .. } => 0,
         }
     }
     pub fn tool_calls(&self) -> &[ToolCall] {
@@ -201,6 +223,10 @@ impl From<ChatMessage> for ChatCompletionMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<ChatCompletionMessage>,
+    /// Extra context reservation per image: Kobold's textual preview does not
+    /// count vision embeddings. Tune to the loaded vision encoder's budget.
+    #[serde(default = "image_reserve")]
+    pub image_token_reserve: u64,
     #[serde(default)]
     pub stop_sequences: Vec<String>,
     #[serde(default = "parameters")]
@@ -215,11 +241,15 @@ pub struct ChatCompletionRequest {
 fn parameters() -> Value {
     json!({})
 }
+fn image_reserve() -> u64 {
+    4096
+}
 impl ChatCompletionRequest {
     /// Tools are disabled by default (no definitions are sent).
     pub fn new(messages: Vec<ChatCompletionMessage>) -> Self {
         Self {
             messages,
+            image_token_reserve: image_reserve(),
             stop_sequences: vec![],
             parameters: parameters(),
             tools: vec![],
@@ -230,6 +260,12 @@ impl ChatCompletionRequest {
     pub fn disable_tools(&mut self) {
         self.tools.clear();
         self.tool_choice = Some(ToolChoice::None);
+    }
+    pub(crate) fn image_tokens(&self) -> Result<u64> {
+        let count: usize = self.messages.iter().map(|m| m.image_count()).sum();
+        (count as u64)
+            .checked_mul(self.image_token_reserve)
+            .context("Image token reservation overflow")
     }
     pub(crate) fn payload(&self, max_context: u64) -> Result<Value> {
         self.units()?;
@@ -429,8 +465,12 @@ impl ChatGenerationResponse {
         else {
             bail!("Chat completion returned a non-assistant role")
         };
+        let text = content.as_ref().and_then(|c| {
+            let parts = c.text_parts();
+            (!parts.is_empty()).then(|| parts.concat())
+        });
         ensure!(
-            content.is_some() || !tool_calls.is_empty(),
+            text.is_some() || !tool_calls.is_empty(),
             "Chat completion returned neither text nor tool calls"
         );
         let mut ids = HashSet::new();
@@ -445,7 +485,7 @@ impl ChatGenerationResponse {
             "finish_reason tool_calls without calls"
         );
         Ok(Self {
-            content: content.clone(),
+            content: text,
             reasoning_content: reasoning_content.clone(),
             tool_calls: tool_calls.clone(),
             message: choice.message,
@@ -540,7 +580,12 @@ pub(crate) fn validate_tool_preview(request: &ChatCompletionRequest, prompt: &st
     }
     let mut remaining = prompt;
     for message in &request.messages {
-        if let Some(content) = message.content().map(str::trim).filter(|c| !c.is_empty()) {
+        for content in message
+            .text_parts()
+            .into_iter()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
             let at = remaining
                 .find(content)
                 .context("Backend template dropped or reordered message content")?;

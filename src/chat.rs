@@ -135,7 +135,8 @@ impl ChatGenerationRequest {
     }
 }
 
-/// Exact backend-rendered prompt and its token count (including template tokens).
+/// Backend-rendered text and budgeted token count (template tokens plus the
+/// request's explicit per-image reserve for multimodal requests).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatPreview {
     pub prompt: String,
@@ -293,7 +294,7 @@ impl KoboldClient {
     ) -> Result<ChatPreview> {
         let mut payload = payload.clone();
         payload["special"] = true.into();
-        let preview = self
+        let mut preview = self
             .http
             .post(format!(
                 "{}/api/extra/tokencount",
@@ -314,6 +315,10 @@ impl KoboldClient {
             bail!("Backend did not render/tokenize the chat messages; refusing unsafe generation");
         }
         crate::tool_chat::validate_tool_preview(request, &preview.prompt)?;
+        preview.tokens = preview
+            .tokens
+            .checked_add(request.image_tokens()?)
+            .context("Multimodal token budget overflow")?;
         Ok(preview)
     }
 
@@ -330,7 +335,7 @@ impl KoboldClient {
     /// local instruct renderer or convert a flat prompt back to messages.
     pub async fn generate_chat(
         &self,
-        request: &ChatGenerationRequest,
+        request: &(impl crate::ChatRequest + ?Sized),
     ) -> Result<GenerationResponse> {
         let response = self.generate_chat_full(request).await?;
         if !response.tool_calls.is_empty() {

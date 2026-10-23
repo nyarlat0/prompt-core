@@ -71,6 +71,12 @@ impl Preset {
             "thinking_budget_tokens",
             "thinking_budget_tokens",
         );
+        copy(
+            src,
+            &mut dst,
+            "chat_template_kwargs",
+            "chat_template_kwargs",
+        );
 
         // Основные samplers.
         copy(src, &mut dst, "temp", "temperature");

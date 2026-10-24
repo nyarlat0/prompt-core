@@ -215,7 +215,7 @@ async fn schema_and_latest_results_cannot_be_trimmed_to_force_fit() {
 }
 
 #[tokio::test]
-async fn rejects_dangling_exchanges_conflicts_and_missing_schemas() {
+async fn rejects_dangling_exchanges_and_conflicts() {
     let (url, h) = server(vec![
         connect_step(),
         (
@@ -258,13 +258,9 @@ async fn rejects_dangling_exchanges_conflicts_and_missing_schemas() {
     let mut r = request();
     r.chat_template_kwargs.insert("messages".into(), json!([]));
     assert!(c.preview_chat(&r).await.is_err());
-    assert!(
-        c.preview_chat(&request())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("tool definition")
-    );
+    // The backend's own tokenizer owns Jinja rendering. A missing tool
+    // definition in the textual preview is no longer a fatal failure.
+    c.preview_chat(&request()).await.unwrap();
     h.join().unwrap();
 }
 
@@ -588,30 +584,43 @@ async fn forced_choice_and_disabled_choice_cannot_be_ignored() {
 }
 
 #[tokio::test]
-async fn full_generation_rejects_budget_overflow_and_lost_tool_arguments() {
+async fn full_generation_checks_budget_but_does_not_parse_jinja_tool_transcript() {
     let mut r = request();
     r.messages.extend([
         assistant(vec![call("a")]),
         ChatCompletionMessage::tool("a", &json!("RESULT")),
     ]);
-    let mut missing_args = preview(&r, 40);
-    missing_args["prompt"] = missing_args["prompt"]
-        .as_str()
-        .unwrap()
-        .replace("{\n  \"key\": \"value\"\n}", "{}")
-        .into();
-    for p in [preview(&r, 1001), missing_args] {
-        let (url, h) = server(vec![
-            connect_step(),
-            (
-                "/api/extra/tokencount",
-                json!({"tools":r.tools,"messages":r.messages}),
-                p,
-            ),
-        ]);
-        assert!(client(url).await.generate_chat_full(&r).await.is_err());
-        h.join().unwrap();
-    }
+    // Finite model context remains an actual backend constraint.
+    let (url, h) = server(vec![
+        connect_step(),
+        (
+            "/api/extra/tokencount",
+            json!({"tools":r.tools,"messages":r.messages}),
+            preview(&r, 1001),
+        ),
+    ]);
+    assert!(client(url).await.generate_chat_full(&r).await.is_err());
+    h.join().unwrap();
+
+    // Even a lossy or custom Jinja template should not be second-guessed
+    // by the library: the backend and model decide how to render its calls.
+    let mut nonstandard = preview(&r, 40);
+    nonstandard["prompt"] = json!("QUESTION\n<assistant tool=lookup><arg omitted/>\nRESULT");
+    let (url, h) = server(vec![
+        connect_step(),
+        (
+            "/api/extra/tokencount",
+            json!({"tools":r.tools,"messages":r.messages}),
+            nonstandard.clone(),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"tools":r.tools,"messages":r.messages}),
+            reply(ChatCompletionMessage::assistant("FINAL"), "stop"),
+        ),
+    ]);
+    assert_eq!(client(url).await.generate_chat_full(&r).await.unwrap().content.as_deref(),Some("FINAL"));
+    h.join().unwrap();
 }
 
 #[test]

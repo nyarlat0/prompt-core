@@ -468,16 +468,17 @@ and [KoboldCpp source](https://github.com/LostRuins/koboldcpp/blob/concedo/kobol
 Older backends/templates may ignore tools or format them through a legacy adapter.
 The preview must return the complete rendered prompt and its token count.
 
-The safety check requires ordinary message content in order, complete JSON
-function definitions (including schema and description), and JSON call arguments
-in the rendered preview. JSON whitespace and object-key order may differ.
-Templates that render schemas/arguments solely as XML, prose or omit fields are
-conservatively rejected; there is no unsafe fallback. Reasoning fields are
-preserved on the wire; their rendering is controlled by the server template.
-These checks catch common lossy templates, but cannot prove equivalence of every
-custom template or protect against server reconfiguration between preview and
-generation. Do not configure server-side parameter overrides that replace the
-request or switch the loaded model during a run.
+The library no longer inspects the rendered Jinja prompt to confirm that
+tool definitions, arguments, reasoning or individual message contents appear
+as literal substrings. That format-dependent check incorrectly rejected valid
+Qwen XML-style tool calls and other backend-specific templates. The backend
+owns its template. Its token count, mandatory context budget, structured
+tool-call parsing, tool-call IDs, and transcript integrity checks remain.
+Reasoning fields are preserved on the wire; their rendering is controlled
+by the server template. Ensure your selected backend template genuinely
+supports tools, because the library does not attempt to verify its text.
+Do not configure server-side parameter overrides that replace the request
+or switch the loaded model during a run.
 
 An optional live example (not run by tests):
 

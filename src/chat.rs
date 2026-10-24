@@ -314,7 +314,6 @@ impl KoboldClient {
         if preview.prompt.is_empty() || preview.tokens == 0 {
             bail!("Backend did not render/tokenize the chat messages; refusing unsafe generation");
         }
-        crate::tool_chat::validate_tool_preview(request, &preview.prompt)?;
         preview.tokens = preview
             .tokens
             .checked_add(request.image_tokens()?)

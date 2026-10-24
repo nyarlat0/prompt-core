@@ -570,6 +570,53 @@ fn json_match_end(prompt: &str, expected: &Value) -> Option<usize> {
         })
 }
 
+/// Qwen's Jinja tool template renders calls as
+/// <function=name><parameter=key>value</parameter></function>, rather than
+/// JSON argument objects. Compare EVERY parameter to the structured call
+/// to avoid accepting truncated, reordered or rewritten arguments.
+fn qwen_parameter_match_end(prompt: &str, expected: &Value) -> Option<usize> {
+    let expected = expected.as_object()?;
+    let body = prompt.strip_prefix('>')?;
+    let closing = body.find("</function>")?;
+    let mut rest = body[..closing].trim();
+    let mut seen = HashSet::new();
+    while !rest.is_empty() {
+        let param = rest.strip_prefix("<parameter=")?;
+        let key_end = param.find('>')?;
+        let key = &param[..key_end];
+        let value_start = &param[key_end + 1..];
+        let value_end = value_start.find("</parameter>")?;
+        let rendered_value = value_start[..value_end].trim();
+        let expected_value = expected.get(key)?;
+        let same = match expected_value {
+            Value::String(value) => rendered_value == value ||
+                serde_json::from_str::<String>(rendered_value).is_ok_and(|v|v==value.as_str()),
+            other => serde_json::from_str::<Value>(rendered_value).is_ok_and(|v|&v==other),
+        };
+        if !same || !seen.insert(key) {
+            return None;
+        }
+        rest = value_start[value_end + "</parameter>".len()..].trim();
+    }
+    (seen.len() == expected.len()).then_some(1 + closing + "</function>".len())
+}
+
+fn tool_arguments_match_end(prompt: &str, args: &Value) -> Option<usize> {
+    // Avoid accidentally validating a missing Qwen parameter by matching
+    // an unrelated JSON object from a later message in the transcript.
+    if prompt.starts_with('>') && prompt.contains("</function>") {
+        let body=prompt[1..].split_once("</function>")?.0.trim();
+        if body.is_empty() || body.starts_with("<parameter=") {
+            return qwen_parameter_match_end(prompt,args);
+        }
+        // Some templates place JSON inside function tags.
+        let offset=prompt.find(body)?;
+        return json_match_end(body,args).map(|end|offset+end);
+    }
+    // JSON-native ChatML/Jinja templates stay supported.
+    json_match_end(prompt,args)
+}
+
 pub(crate) fn validate_tool_preview(request: &ChatCompletionRequest, prompt: &str) -> Result<()> {
     for tool in &request.tools {
         ensure!(
@@ -597,7 +644,7 @@ pub(crate) fn validate_tool_preview(request: &ChatCompletionRequest, prompt: &st
                 .context("Backend template omitted or reordered tool call")?;
             remaining = &remaining[at + call.function.name.len()..];
             let args: Value = call.arguments()?;
-            let end = json_match_end(remaining, &args).with_context(|| {
+            let end = tool_arguments_match_end(remaining, &args).with_context(|| {
                 format!(
                     "Backend template omitted or transformed tool arguments for {}",
                     call.id
@@ -607,4 +654,92 @@ pub(crate) fn validate_tool_preview(request: &ChatCompletionRequest, prompt: &st
         }
     }
     Ok(())
+}
+
+// Regression: Qwen's <parameter=...> rendering preserves the exact tool-call
+// arguments but does not contain the JSON object returned by the API.
+#[cfg(test)]
+mod qwen_tool_preview_tests {
+    use super::*;
+    fn schema() -> ToolDefinition {
+        ToolDefinition::new("piece_at","One square",json!({
+            "type":"object","properties":{"square":{"type":"string"}},
+            "required":["square"]
+        }))
+    }
+    fn request(calls: &[&str]) -> ChatCompletionRequest {
+        let tool_calls=calls.iter().enumerate().map(|(i,s)| ToolCall {
+            id:format!("call_{i}"),
+            kind:ToolType::Function,
+            function:FunctionCall {
+                name:"piece_at".into(),
+                arguments:json!({"square":s}).to_string(),
+            },
+        }).collect::<Vec<_>>();
+        let mut req=ChatCompletionRequest::new(vec![
+            ChatCompletionMessage::user("Inspect squares"),
+            ChatCompletionMessage::Assistant {
+                content:None, reasoning_content:None,tool_calls:tool_calls.clone(),
+                extra:Map::new()
+            },
+        ]);
+        for (i,cell) in calls.iter().enumerate() {
+            req.messages.push(ChatCompletionMessage::Tool {
+                tool_call_id:format!("call_{i}"),
+                content:json!({"square":cell,"piece":null}).to_string(),
+            });
+        }
+        req.tools.push(schema());
+        req
+    }
+    fn render(req:&ChatCompletionRequest, rendered_calls:&[&str]) -> String {
+        let mut p=serde_json::to_string(&req.tools).unwrap();
+        p.push_str("\nInspect squares\n");
+        for body in rendered_calls {
+            p.push_str(&format!("<tool_call><function=piece_at>{body}</function></tool_call>"));
+        }
+        for i in 0..rendered_calls.len() {
+            p.push_str(&format!("{}\n",req.messages[i+2].content().unwrap()));
+        }
+        p
+    }
+    #[test]
+    fn accepts_qwen_xml_tool_calls_and_json_native_calls() {
+        let req=request(&["c3","c5"]);
+        let xml=render(&req,&[
+            "\n<parameter=square>\nc3\n</parameter>\n",
+            "\n<parameter=square>\nc5\n</parameter>\n"
+        ]);
+        validate_tool_preview(&req,&xml).unwrap();
+        let json_calls=render(&req,&[
+            r#"{"square":"c3"}"#,
+            r#"{"square":"c5"}"#
+        ]);
+        validate_tool_preview(&req,&json_calls).unwrap();
+    }
+    #[test]
+    fn rejects_missing_or_mutated_qwen_parameters() {
+        let req=request(&["c3"]);
+        for body in [
+            "",
+            "<parameter=square>c4</parameter>",
+            "<parameter=other>c3</parameter>",
+            "<parameter=square>c3</parameter><parameter=extra>c4</parameter>",
+            "<parameter=square>c3</parameter><parameter=square>c3</parameter>",
+            "<parameter=square>c3</parameter><parameter=other>c4</parameter>"
+        ] {
+            let preview=render(&req,&[body]);
+            let e=validate_tool_preview(&req,&preview).unwrap_err();
+            assert!(format!("{e:#}").contains("tool arguments"),"{e:#}");
+        }
+    }
+    #[test]
+    fn rejects_missing_parameter_from_later_qwen_call() {
+        let req=request(&["c3","c5"]);
+        let p=render(&req,&[
+            "<parameter=square>c3</parameter>",
+            "<parameter=square>c6</parameter>"
+        ]);
+        assert!(validate_tool_preview(&req,&p).is_err());
+    }
 }

@@ -639,10 +639,28 @@ pub(crate) fn validate_tool_preview(request: &ChatCompletionRequest, prompt: &st
             remaining = &remaining[at + content.len()..];
         }
         for call in message.tool_calls() {
-            let at = remaining
-                .find(&call.function.name)
-                .context("Backend template omitted or reordered tool call")?;
-            remaining = &remaining[at + call.function.name.len()..];
+            if let Some(at) = remaining.find("<function=") {
+                // In Qwen tool templates the assistant's reasoning may mention
+                // the tool name before any actual call. Require the real
+                // <function=name> delimiter, never an arbitrary name substring.
+                let name_start = at + "<function=".len();
+                let name_end = remaining[name_start..]
+                    .find('>')
+                    .map(|offset| name_start + offset)
+                    .context("Backend template contains an unterminated tool function tag")?;
+                ensure!(
+                    &remaining[name_start..name_end] == call.function.name,
+                    "Backend template omitted or reordered tool call {}",
+                    call.id
+                );
+                remaining = &remaining[name_end..];
+            } else {
+                // JSON-native tool templates have no <function=...> tags.
+                let at = remaining
+                    .find(&call.function.name)
+                    .context("Backend template omitted or reordered tool call")?;
+                remaining = &remaining[at + call.function.name.len()..];
+            }
             let args: Value = call.arguments()?;
             let end = tool_arguments_match_end(remaining, &args).with_context(|| {
                 format!(
@@ -717,6 +735,28 @@ mod qwen_tool_preview_tests {
         ]);
         validate_tool_preview(&req,&json_calls).unwrap();
     }
+    #[test]
+    fn reasoning_mention_of_tool_name_does_not_mask_real_qwen_call() {
+        let req = request(&["c3", "c5"]);
+        // Kobold can render assistant reasoning before tool calls. An unanchored
+        // search for "piece_at" hits this prose, not <function=piece_at>.
+        let mut preview = serde_json::to_string(&req.tools).unwrap();
+        preview.push_str("\nInspect squares\n");
+        preview.push_str("<think>Let me check with piece_at. Maybe call piece_at again.</think>\n");
+        preview.push_str("<tool_call><function=piece_at>\n<parameter=square>\nc3\n</parameter>\n</function></tool_call>\n");
+        preview.push_str("<tool_call><function=piece_at>\n<parameter=square>\nc5\n</parameter>\n</function></tool_call>\n");
+        for message in &req.messages[2..] {
+            preview.push_str(message.content().unwrap());
+            preview.push('\n');
+        }
+        validate_tool_preview(&req, &preview).unwrap();
+
+        // Validating the intended call is essential: a changed square must
+        // still be rejected even when the reasoning names the correct tool.
+        let mutated = preview.replace("<parameter=square>\nc3\n", "<parameter=square>\nc4\n");
+        assert!(validate_tool_preview(&req, &mutated).is_err());
+    }
+
     #[test]
     fn rejects_missing_or_mutated_qwen_parameters() {
         let req=request(&["c3"]);
